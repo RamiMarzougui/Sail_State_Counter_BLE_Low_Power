@@ -1,0 +1,627 @@
+               .deffile adi_defs__1.asm
+               .deffile ddi_defs__1.asm
+               .deffile reg_defs__1.asm
+               .deffile sce_defs__1.asm
+
+               ; Number of supported tasks
+               .define TASK_COUNT      1
+
+               ; Sensor Controller clock frequency in active mode
+               .define ACTIVE_MODE_SCE_CLK_FREQ_MHZ    24
+
+               ; Resource-specified definitions, if any
+               ; (None)
+
+
+               .segment begin "Framework"
+
+
+               VectorTable:
+                                       ; SW 0
+0000 ---- 140e                         jsr         PowerUp
+0001 ---- 0417                         jmp         TaskCtrlReqVector
+                                       ; SW 1
+0002 ---- 140e                         jsr         PowerUp
+0003 ---- 0438                         jmp         EventManTrigVector
+                                       ; PROG 0
+0004 ---- 140e                         jsr         PowerUp
+0005 ---- 0442                         jmp         AonRtcCh2Vector
+                                       ; PROG 1
+0006 ---- 140e                         jsr         PowerUp
+0007 ---- 045f                         jmp         Event0Vector
+                                       ; PROG 2
+0008 ---- 140e                         jsr         PowerUp
+0009 ---- 0468                         jmp         Event1Vector
+                                       ; PROG 3
+000a ---- 140e                         jsr         PowerUp
+000b ---- 0471                         jmp         Event2Vector
+                                       ; SW 2
+000c ---- 140e                         jsr         PowerUp
+000d ---- 047a                         jmp         TaskAlertAckVector
+
+
+
+
+               PowerUp:
+                                       ; Make sure that the last operation mode request has taken effect
+000e ---- 8953                         in          R0, [#IOP_SYSIF_OPMODEREQ]
+000f ---- 9954 /waitForOpmodeSync:     in          R1, [#IOP_SYSIF_OPMODEACK]
+0010 ---- 8d29                         cmp         R0, R1
+0011 ---- befd                         bneq        /waitForOpmodeSync
+
+                                       ; Deassert the power-down request
+0012 ---- 4553                         iobclr      #IOB_SYSIF_OPMODE_PD, [#IOP_SYSIF_OPMODEREQ]
+
+                                       ; Wait for it to take effect
+0013 ---- 2554 /waitForOpmodeAck:      iobtst      #IOB_SYSIF_OPMODE_PD, [#IOP_SYSIF_OPMODEACK]
+0014 ---- aefe                         biob1       /waitForOpmodeAck
+
+                                       ; Prevent wake-up events from propagating to the AON domain
+0015 ---- 445c                         iobclr      #0, [#IOP_SYSIF_WUGATE]
+
+               FwEmptyFunc:            ; Done
+0016 ---- adb7                         rts
+
+
+
+
+               TaskCtrlReqVector:
+                                       ; Clear wake-up event
+0017 ---- 745b                         iobset      #IOB_SYSIF_WUFLAGS_SW_WU0, [#IOP_SYSIF_WUFLAGSCLR]
+0018 ---- 545b                         iobclr      #IOB_SYSIF_WUFLAGS_SW_WU0, [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; For each task ...
+0019 ---- 7000                         ld          R7, #0
+               /loop:
+                                           ; Save the task ID
+001a ---- 7ca2                             st          R7, [#fwCtrlInt/taskId]
+
+                                           ; Handle initialize request, if any
+001b ---- 68ab                             ld          R6, [#fwCtrlExt/bvTaskInitializeReq]
+001c ---- 009f                             ld          R0, #pFwTaskInitializeFuncTable
+001d ---- 1431                             jsr         /handleReq
+
+                                           ; Handle execute request, if any
+001e ---- 68ac                             ld          R6, [#fwCtrlExt/bvTaskExecuteReq]
+001f ---- 00a0                             ld          R0, #pFwTaskExecuteFuncTable
+0020 ---- 1431                             jsr         /handleReq
+
+                                           ; Handle terminate request, if any
+0021 ---- 68ad                             ld          R6, [#fwCtrlExt/bvTaskTerminateReq]
+0022 ---- 00a1                             ld          R0, #pFwTaskTerminateFuncTable
+0023 ---- 1431                             jsr         /handleReq
+
+                                           ; Move on to the next task
+0024 ---- 78a2                             ld          R7, [#fwCtrlInt/taskId]
+0025 ---- f801                             add         R7, #1
+
+0026 ---- fa01                         cmp         R7, #TASK_COUNT
+0027 ---- bef2                         bneq        /loop
+
+                                       ; Update which tasks are ...
+0028 ---- 78a9                         ld          R7, [#fwCtrlExt/bvActiveTasks]
+                                       ; ... currently active ...
+0029 ---- 68ab                         ld          R6, [#fwCtrlExt/bvTaskInitializeReq]
+002a ---- fd0e                         or          R7, R6
+                                       ; ... and inactive ...
+002b ---- 68ad                         ld          R6, [#fwCtrlExt/bvTaskTerminateReq]
+002c ---- ed92                         inv         R6
+002d ---- fd06                         and         R7, R6
+002e ---- 7ca9                         st          R7, [#fwCtrlExt/bvActiveTasks]
+
+                                       ; We're READY for another request
+002f ---- 6440                         iobset      #IOB_EVCTL_SWEV_READY, [#IOP_EVCTL_SWEVSET]
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+0030 ---- 047f                         jmp         PowerDownSequence;
+
+               /handleReq:
+                                       ; Restore the task ID, and load the function pointer (here to avoid pipeline hazard)
+0031 ---- 78a2                         ld          R7, [#fwCtrlInt/taskId]
+0032 ---- 8f1f                         ld          R0, [R7+R0]
+
+                                       ; Skip this request?
+0033 ---- ed8f                         lsr         R6, R7
+0034 ---- ec01                         tst         R6, #0x0001
+0035 ---- be01                         bnz         /noSkip
+0036 ---- adb7                             rts
+               /noSkip:
+                                       ; Make the call by jump, with return (rts) in the "called" function
+0037 ---- 8db7                         jmp         R0
+
+
+
+
+               EventManTrigVector:
+                                       ; Clear wake-up event
+0038 ---- 755b                         iobset      #IOB_SYSIF_WUFLAGS_SW_WU1, [#IOP_SYSIF_WUFLAGSCLR]
+0039 ---- 555b                         iobclr      #IOB_SYSIF_WUFLAGS_SW_WU1, [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; Reconfigure the programmable wake-up, and trigger it
+003a ---- 78a7                         ld          R7, [#fwCtrlInt/progwucfgManTrigReg]
+003b ---- 60bf                         ld          R6, #(BV_SYSIF_PROGWUCFG_POL | SYSIF_PROGWUCFG_SRC_NO_EVENT)
+003c ---- ef27                         out         R6, [R7]
+003d ---- e240                         or          R6, #BV_SYSIF_PROGWUCFG_EN
+003e ---- ef27                         out         R6, [R7]
+
+                                       ; Indicate completion
+003f ---- 7000                         ld          R7, #0x0000
+0040 ---- 7ca7                         st          R7, [#fwCtrlInt/progwucfgManTrigReg]
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+0041 ---- 047f                         jmp         PowerDownSequence;
+
+
+
+
+               AonRtcCh2Vector:
+                                       ; Start clearing the RTC event
+0042 ---- 6477                         iobset      #0, [#IOP_SYSIF_RTCEVCLR]
+
+                                       ; For each task (R0 is the current task ID) ...
+0043 ---- 0000                         ld          R0, #0
+               /loop:
+                                           ; ... that is active ...
+0044 ---- 18a9                             ld          R1, [#fwCtrlExt/bvActiveTasks]
+0045 ---- 9d88                             lsr         R1, R0
+0046 ---- 9c01                             tst         R1, #0x0001
+0047 ---- b60e                             bz          /skip
+
+                                               ; Fetch number of RTC intervals until next execution
+0048 ---- 109e                                 ld          R1, #pFwTaskExecuteScheduleTable
+0049 ---- af19                                 ld          R2, [R1+R0]
+
+                                               ; If not already 0, decrement and store. If then 0 ...
+004a ---- aa00                                 cmp         R2, #0
+004b ---- b60a                                 beq         /skip
+004c ---- a8ff                                 add         R2, #-1
+004d ---- af39                                 st          R2, [R1+R0]
+004e ---- be07                                 bnz         /skip
+
+                                                   ; ... execute the task
+004f ---- 0ca2                                     st          R0, [#fwCtrlInt/taskId]
+0050 8600 88a0                                     add         R0, #pFwTaskExecuteFuncTable
+0052 ---- 8f08                                     ld          R0, [R0]
+                                                   ; Insert NOP to avoid pipeline hazard
+0053 ---- fd47                                     nop
+0054 ---- 9db7                                     jsr         R0
+0055 ---- 08a2                                     ld          R0, [#fwCtrlInt/taskId]
+               /skip:
+                                           ; Move on to the next task
+0056 ---- 8801                             add         R0, #1
+
+0057 ---- 8a01                         cmp         R0, #TASK_COUNT
+0058 ---- beeb                         bneq        /loop
+
+                                       ; Wait for the RTC CH2 event clearing to finish
+0059 ---- 254f /waitOnRtcEvClr:        iobtst      #IOB_EVCTL_EVSTAT2L_AON_RTC_CH2, [#IOP_EVCTL_EVSTAT2L]
+005a ---- aefe                         biob1       /waitOnRtcEvClr
+
+                                       ; Clear event edge detector
+005b ---- 645b                         iobset      #IOB_SYSIF_WUFLAGS_PROG_WU0, [#IOP_SYSIF_WUFLAGSCLR]
+005c ---- 445b                         iobclr      #IOB_SYSIF_WUFLAGS_PROG_WU0, [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; End clearing the RTC event
+005d ---- 4477                         iobclr      #0, [#IOP_SYSIF_RTCEVCLR]
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+005e ---- 047f                         jmp         PowerDownSequence;
+
+
+
+
+               Event0Vector:
+                                       ; Disable and clear wake-up event
+005f ---- 5656                         iobclr      #IOB_SYSIF_PROGWUCFG_EN,        [#IOP_SYSIF_PROGWU1CFG] ; Disable source
+0060 ---- 655b                         iobset      #IOB_SYSIF_WUFLAGS_PROG_WU1,    [#IOP_SYSIF_WUFLAGSCLR] ; Clear edge detector
+0061 ---- 455b                         iobclr      #IOB_SYSIF_WUFLAGS_PROG_WU1,    [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; Set the task ID and active event index
+0062 ---- 0000                         ld          R0, #0
+0063 ---- 0ca2                         st          R0, [#fwCtrlInt/taskId]
+0064 ---- 0001                         ld          R0, #(1 << 0)
+0065 ---- 0ca3                         st          R0, [#fwCtrlInt/bvActiveEvent]
+
+                                       ; Jump to the event task code
+0066 ---- 14ba                         jsr         count/event0
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+0067 ---- 047f                         jmp         PowerDownSequence;
+
+
+
+
+               Event1Vector:
+                                       ; Disable and clear wake-up event
+0068 ---- 5657                         iobclr      #IOB_SYSIF_PROGWUCFG_EN,        [#IOP_SYSIF_PROGWU2CFG] ; Disable source
+0069 ---- 665b                         iobset      #IOB_SYSIF_WUFLAGS_PROG_WU2,    [#IOP_SYSIF_WUFLAGSCLR] ; Clear edge detector
+006a ---- 465b                         iobclr      #IOB_SYSIF_WUFLAGS_PROG_WU2,    [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; Set the task ID and active event index
+006b ---- 0000                         ld          R0, #0
+006c ---- 0ca2                         st          R0, [#fwCtrlInt/taskId]
+006d ---- 0002                         ld          R0, #(1 << 1)
+006e ---- 0ca3                         st          R0, [#fwCtrlInt/bvActiveEvent]
+
+                                       ; Jump to the event task code
+006f ---- 1416                         jsr         FwEmptyFunc
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+0070 ---- 047f                         jmp         PowerDownSequence;
+
+
+
+
+               Event2Vector:
+                                       ; Disable and clear wake-up event
+0071 ---- 5658                         iobclr      #IOB_SYSIF_PROGWUCFG_EN,        [#IOP_SYSIF_PROGWU3CFG] ; Disable source
+0072 ---- 675b                         iobset      #IOB_SYSIF_WUFLAGS_PROG_WU3,    [#IOP_SYSIF_WUFLAGSCLR] ; Clear edge detector
+0073 ---- 475b                         iobclr      #IOB_SYSIF_WUFLAGS_PROG_WU3,    [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; Set the task ID and active event index
+0074 ---- 0000                         ld          R0, #0
+0075 ---- 0ca2                         st          R0, [#fwCtrlInt/taskId]
+0076 ---- 0004                         ld          R0, #(1 << 2)
+0077 ---- 0ca3                         st          R0, [#fwCtrlInt/bvActiveEvent]
+
+                                       ; Jump to the event task code
+0078 ---- 1416                         jsr         FwEmptyFunc
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+0079 ---- 047f                         jmp         PowerDownSequence;
+
+
+
+
+               TaskAlertAckVector:
+                                       ; Clear wake-up event
+007a ---- 765b                         iobset      #IOB_SYSIF_WUFLAGS_SW_WU2, [#IOP_SYSIF_WUFLAGSCLR]
+007b ---- 565b                         iobclr      #IOB_SYSIF_WUFLAGS_SW_WU2, [#IOP_SYSIF_WUFLAGSCLR]
+
+                                       ; Re-enable generation of ALERT interrupts
+007c 86ff 03ff                         ld          R0, #0xFFFF
+007e ---- 0ca5                         st          R0, [#fwCtrlInt/alertGenMask]
+
+                                       ; Generate an ALERT interrupt (if requested) and return to sleep
+                                       ; -> Fall through
+
+
+
+
+               PowerDownSequence:
+                                       ; Let wake-up events propagate to the AON domain
+007f ---- 645c                         iobset      #0, [#IOP_SYSIF_WUGATE]
+
+                                       ; Do we have any ALERT-generating flags pending?
+0080 ---- 78a4                         ld          R7, [#fwCtrlInt/bvTaskIoAlert]
+
+                                       ; Skip if the last I/O ALERT interrupt has not been acknowledged
+0081 ---- 68a5                         ld          R6, [#fwCtrlInt/alertGenMask]
+0082 ---- ed37                         tst         R6, R7
+0083 ---- b605                         bz          /skipAlertGen
+
+                                           ; Transfer I/O flags from internal to external
+0084 ---- 0000                             ld          R0, #0
+0085 ---- 0ca4                             st          R0, [#fwCtrlInt/bvTaskIoAlert]
+0086 ---- 7caa                             st          R7, [#fwCtrlExt/bvTaskIoAlert]
+
+                                           ; Generate the ALERT interrupt, and clear the generation mask
+0087 ---- 6540                             iobset      #IOB_EVCTL_SWEV_ALERT, [#IOP_EVCTL_SWEVSET]
+0088 ---- 0ca5                             st          R0, [#fwCtrlInt/alertGenMask]
+               /skipAlertGen:
+                                       ; Set initial power mode for next executed vector
+                                       ; -> Only at initialization
+
+                                       ; If there are no unacknowledged ALERTs and no vectors pending ...
+0089 ---- 78a5                         ld          R7, [#fwCtrlInt/alertGenMask]
+008a ---- 68a6                         ld          R6, [#fwCtrlInt/alertCanPdAuxMask]
+008b ---- fd0e                         or          R7, R6
+008c ---- f801                         add         R7, #1 ; 0xFFFF -> 0x0000
+008d ---- e95a                         in          R6, [#IOP_SYSIF_WUFLAGS]
+008e ---- fd0e                         or          R7, R6
+008f ---- be01                         bnz         /noPowerDown
+
+                                           ; Assert the power-down request
+0090 ---- 6553                             iobset      #IOB_SYSIF_OPMODE_PD, [#IOP_SYSIF_OPMODEREQ]
+               /noPowerDown:
+                                       ; Sleep until the next event
+0091 ---- bdb7 sleepInstr:             sleep
+
+
+
+
+               PwrRequestAndWaitForActiveMode:
+                                       ; Update Reference DAC clock divider before entering active mode
+0092 ---- 700b                         ld          R7, #((ACTIVE_MODE_SCE_CLK_FREQ_MHZ / 2) - 1)
+0093 ---- fb96                         out         R7, [#IOP_ANAIF_DACSMPLCFG0]
+
+                                       ; Deassert the low-power request
+0094 ---- 4453                         iobclr      #IOB_SYSIF_OPMODE_LP, [#IOP_SYSIF_OPMODEREQ]
+
+                                       ; Wait for it to take effect
+0095 ---- 2454 /waitForOpmodeAck:      iobtst      #IOB_SYSIF_OPMODE_LP, [#IOP_SYSIF_OPMODEACK]
+0096 ---- aefe                         biob1       /waitForOpmodeAck
+
+                                       ; Done
+0097 ---- adb7                         rts
+
+
+
+
+               PwrRequestAndWaitForLowPowerMode:
+                                       ; Assert the low-power request
+0098 ---- 6453                         iobset      #IOB_SYSIF_OPMODE_LP, [#IOP_SYSIF_OPMODEREQ]
+
+                                       ; Wait for it to take effect
+0099 ---- 2454 /waitForOpmodeAck:      iobtst      #IOB_SYSIF_OPMODE_LP, [#IOP_SYSIF_OPMODEACK]
+009a ---- a6fe                         biob0       /waitForOpmodeAck
+
+                                       ; Update Reference DAC clock divider after leaving active mode
+009b ---- 7000                         ld          R7, #(1 - 1)
+009c ---- fb96                         out         R7, [#IOP_ANAIF_DACSMPLCFG0]
+
+                                       ; Done
+009d ---- adb7                         rts
+
+
+
+
+               ; RTC ticks until next execution, one word for each task
+               pFwTaskExecuteScheduleTable:
+009e ---- 0000                         dw          #0
+
+               ; Task code function pointers for each task code block, one word for each task
+               pFwTaskInitializeFuncTable:
+009f ---- 00b3                         dw          #count/initialize
+               pFwTaskExecuteFuncTable:
+00a0 ---- 00b9                         dw          #count/execute
+               pFwTaskTerminateFuncTable:
+00a1 ---- 0117                         dw          #count/terminate
+
+               ; Run-time logging log requests and masks, one bit for each struct, one word for each task
+               pRtlTaskLogReqTable:
+               ; (Run-time logging is not used in this project)
+               pRtlTaskLogMaskTable:
+               ; (Run-time logging is not used in this project)
+
+
+               ; Internal control data
+               fwCtrlInt:
+00a2 ---- 0000 /taskId:                dw          #0      ; ID of the currently running task
+00a3 ---- 0000 /bvActiveEvent:         dw          #0      ; Bit-vector indicating index of the currently active event trigger
+00a4 ---- 0000 /bvTaskIoAlert:         dw          #0x0000 ; LSB = Normal data exchange, MSB = Overflow or underflow
+00a5 ---- ffff /alertGenMask:          dw          #0xFFFF ; Can generate an ALERT interrupt now? (0xFFFF = yes, 0x0000 = no)
+00a6 ---- 0000 /alertCanPdAuxMask:     dw          #0x0000 ; Can power down AUX domain after ALERT interrupt generation? (0xFFFF = yes, 0x0000 = no)
+00a7 ---- 0000 /progwucfgManTrigReg:   dw          #0x0000 ; Address of PROGWUnCFG register to be triggered manually by EventManTriggerVector
+00a8 ---- 0000 /rtlStructLockReq:      dw          #0x0000 ; Run-time logging struct lock request (0=idle -> 1=requested -> 2=ready -> access -> 0=idle)
+
+               ; External control data, shared with the driver
+               fwCtrlExt:
+00a9 ---- 0000 /bvActiveTasks:         dw          #0x0000 ; Indicates which tasks are currently active
+00aa ---- 0000 /bvTaskIoAlert:         dw          #0x0000 ; LSB = Normal data exchange, MSB = Overflow or underflow
+00ab ---- 0000 /bvTaskInitializeReq:   dw          #0x0000 ; Requests tasks to start
+00ac ---- 0000 /bvTaskExecuteReq:      dw          #0x0000 ; Requests tasks to execute once immediately
+00ad ---- 0000 /bvTaskTerminateReq:    dw          #0x0000 ; Requests tasks to stop
+
+
+               .segment end "Framework"
+
+
+               fwTaskDataStructures:
+               .segment begin "Task: Count"
+               count/cfg:
+               count/input:
+               count/output:
+               count/output/F1Lsb:
+00ae ---- 0000                         dw          #0
+               count/output/F1Msb:
+00af ---- 0000                         dw          #0
+               count/output/OnLsb:
+00b0 ---- 0000                         dw          #0
+               count/output/OnMsb:
+00b1 ---- 0000                         dw          #0
+               count/state:
+               count/state/pulseCounter:
+00b2 ---- 0000                         dw          #0
+               .segment end "Task: Count"
+
+
+               .segment begin "Task: Count"
+               count/initialize:
+               ;? // Set up the next interrupt trigger on INT2
+               ;? evhSetupGpioTrigger(0, AUXIO_I_INT2COUNT, 1, EVH_GPIO_TRIG_ON_EDGE);
+00b3 ---- 0015                         ld          R0, #((21 + SYSIF_PROGWUCFG_SRC_AUXIO0) |((1 == 0) << IOB_SYSIF_PROGWUCFG_POL))
+00b4 ---- 8b56                         out         R0, [#((IOP_SYSIF_PROGWU1CFG + 0) + 0)]
+00b5 ---- 655b                         iobset      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+00b6 ---- 7656                         iobset      #IOB_SYSIF_PROGWUCFG_EN, [#((IOP_SYSIF_PROGWU1CFG + 0) + 0)]
+00b7 ---- 455b                         iobclr      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+               count/initializeDone:
+00b8 ---- adb7                         rts
+
+
+
+
+               count/execute:
+               ;?
+               count/executeDone:
+00b9 ---- adb7                         rts
+
+
+
+
+               count/event0:
+               ;? U16 pulseCount;
+               ;?
+               ;? //------- Lecture des datas de l'XL ------------ //
+               ;?
+               ;? // Enable pulse counter with digital input pin as source
+               ;? pcntEnable(AUXIO_I_INT2COUNT);
+00ba ---- 0015                         ld          R0, #21
+00bb ---- 8b3a                         out         R0, [#IOP_TDC_PRECTL]
+00bc ---- 773a                         iobset      #IOB_TDC_PRECTL_RESET_N, [#IOP_TDC_PRECTL]
+               ;?
+               ;? // raz counter
+               ;? state.pulseCounter = 0;
+00bd ---- 0000                         ld          R0, #0
+00be ---- 0cb2                         st          R0, [#count/state/pulseCounter]
+               ;?
+               ;? // Count pulses until no new pulses have occurred for 400 ms
+               ;? pulseCount = 0;
+               ;? fwDelayUs(50000);
+00bf 86c3 0350                         ld          R0, #-15536
+00c1 ---- 8801                         add         R0, #1
+00c2 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00c3 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00c4 86c3 0350                         ld          R0, #-15536
+00c6 ---- 8801                         add         R0, #1
+00c7 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00c8 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00c9 86c3 0350                         ld          R0, #-15536
+00cb ---- 8801                         add         R0, #1
+00cc ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00cd ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00ce 86c3 0350                         ld          R0, #-15536
+00d0 ---- 8801                         add         R0, #1
+00d1 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00d2 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00d3 86c3 0350                         ld          R0, #-15536
+00d5 ---- 8801                         add         R0, #1
+00d6 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00d7 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00d8 86c3 0350                         ld          R0, #-15536
+00da ---- 8801                         add         R0, #1
+00db ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00dc ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00dd 86c3 0350                         ld          R0, #-15536
+00df ---- 8801                         add         R0, #1
+00e0 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00e1 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;? fwDelayUs(50000);
+00e2 86c3 0350                         ld          R0, #-15536
+00e4 ---- 8801                         add         R0, #1
+00e5 ---- 8b49                         out         R0, [#IOP_EVCTL_PROGDLY]
+00e6 ---- 8db1                         wev1        #WEVSEL_PROG_DLY
+               ;?
+               ;? pcntGetValue(pulseCount);
+00e7 ---- fb3b                         out         R7, [#IOP_TDC_PRECNTR]
+00e8 ---- fd47                         nop
+00e9 ---- 893b                         in          R0, [#IOP_TDC_PRECNTR]
+00ea ---- 8801                         add         R0, #1
+               ;?
+               ;? state.pulseCounter = pulseCount;
+00eb ---- 0cb2                         st          R0, [#count/state/pulseCounter]
+               ;?
+               ;? // Disable Pulse counter
+               ;? pcntDisable();
+00ec ---- 573a                         iobclr      #IOB_TDC_PRECTL_RESET_N, [#IOP_TDC_PRECTL]
+               ;?
+               ;? //------- Décodage valeure pulse counter ------------ //
+               ;?
+               ;? if(state.pulseCounter == 3){
+00ed ---- 08b2                         ld          R0, [#count/state/pulseCounter]
+00ee ---- 8a03                         cmp         R0, #3
+00ef ---- be03                         bneq        /id0086
+               ;?     fwGenAlertInterrupt();
+00f0 ---- 08a4                             ld          R0, [#fwCtrlInt/bvTaskIoAlert]
+00f1 ---- 8201                             or          R0, #(1 << 0)
+00f2 ---- 0ca4                             st          R0, [#fwCtrlInt/bvTaskIoAlert]
+               ;? }
+               /id0086:
+               ;?
+               ;? // Etat ON
+               ;? if (state.pulseCounter == 4){
+00f3 ---- 08b2                         ld          R0, [#count/state/pulseCounter]
+00f4 ---- 8a04                         cmp         R0, #4
+00f5 ---- be0c                         bneq        /id0089
+               ;?     // Check si overflow du compteur
+               ;?     if (output.OnLsb >= 65535){
+00f6 ---- 08b0                             ld          R0, [#count/output/OnLsb]
+00f7 ---- 8aff                             cmp         R0, #-1
+00f8 ---- ae06                             bltu        /id0091
+               ;?         output.OnLsb = 0;
+00f9 ---- 0000                                 ld          R0, #0
+00fa ---- 0cb0                                 st          R0, [#count/output/OnLsb]
+               ;?         output.OnMsb = output.OnMsb + 1;
+00fb ---- 08b1                                 ld          R0, [#count/output/OnMsb]
+00fc ---- 8801                                 add         R0, #1
+00fd ---- 0cb1                                 st          R0, [#count/output/OnMsb]
+               ;?     } else {
+00fe ---- 0502                             jmp         /id0093
+               /id0091:
+               ;?         output.OnLsb = output.OnLsb + 1;
+00ff ---- 08b0                                 ld          R0, [#count/output/OnLsb]
+0100 ---- 8801                                 add         R0, #1
+0101 ---- 0cb0                                 st          R0, [#count/output/OnLsb]
+               ;?     }
+               /id0093:
+               ;? }
+               /id0089:
+               ;?
+               ;? // Etat F1
+               ;? if (state.pulseCounter == 5){
+0102 ---- 08b2                         ld          R0, [#count/state/pulseCounter]
+0103 ---- 8a05                         cmp         R0, #5
+0104 ---- be0c                         bneq        /id0097
+               ;?     // Check si overflow du compteur
+               ;?     if (output.F1Lsb >= 65535){
+0105 ---- 08ae                             ld          R0, [#count/output/F1Lsb]
+0106 ---- 8aff                             cmp         R0, #-1
+0107 ---- ae06                             bltu        /id0099
+               ;?         output.F1Lsb = 0;
+0108 ---- 0000                                 ld          R0, #0
+0109 ---- 0cae                                 st          R0, [#count/output/F1Lsb]
+               ;?         output.F1Msb = output.F1Msb + 1;
+010a ---- 08af                                 ld          R0, [#count/output/F1Msb]
+010b ---- 8801                                 add         R0, #1
+010c ---- 0caf                                 st          R0, [#count/output/F1Msb]
+               ;?     } else {
+010d ---- 0511                             jmp         /id0101
+               /id0099:
+               ;?         output.F1Lsb = output.F1Lsb + 1;
+010e ---- 08ae                                 ld          R0, [#count/output/F1Lsb]
+010f ---- 8801                                 add         R0, #1
+0110 ---- 0cae                                 st          R0, [#count/output/F1Lsb]
+               ;?     }
+               /id0101:
+               ;? }
+               /id0097:
+               ;?
+               ;? // Wakeup CPU
+               ;? //fwGenAlertInterrupt();
+               ;?
+               ;? // Set up the next interrupt trigger on INT2
+               ;? evhSetupGpioTrigger(0, AUXIO_I_INT2COUNT, 1, EVH_GPIO_TRIG_ON_EDGE);
+0111 ---- 0015                         ld          R0, #((21 + SYSIF_PROGWUCFG_SRC_AUXIO0) |((1 == 0) << IOB_SYSIF_PROGWUCFG_POL))
+0112 ---- 8b56                         out         R0, [#((IOP_SYSIF_PROGWU1CFG + 0) + 0)]
+0113 ---- 655b                         iobset      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+0114 ---- 7656                         iobset      #IOB_SYSIF_PROGWUCFG_EN, [#((IOP_SYSIF_PROGWU1CFG + 0) + 0)]
+0115 ---- 455b                         iobclr      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+               count/event0Done:
+0116 ---- adb7                         rts
+
+
+
+
+               count/terminate:
+               ;? // The currently enabled event trigger must be cancelled manually
+               ;? evhCancelTrigger(0);
+0117 ---- 5656                         iobclr      #IOB_SYSIF_PROGWUCFG_EN, [#((IOP_SYSIF_PROGWU1CFG + 0) + 0)]
+0118 ---- 655b                         iobset      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+0119 ---- 455b                         iobclr      #((IOB_SYSIF_WUFLAGS_PROG_WU1 + 0) + 0), [#IOP_SYSIF_WUFLAGSCLR]
+               count/terminateDone:
+011a ---- adb7                         rts
+               .segment end "Task: Count"
+
+
+               .segment begin "Procedure Library"
+               ; No library functions used
+               .segment end "Procedure Library"
+
+
+; Generated by BE-2 at 2023-10-18 16:51:46.691
